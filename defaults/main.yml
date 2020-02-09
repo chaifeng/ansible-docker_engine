@@ -1,0 +1,3 @@
+docker_users: []
+docker_version: '*'
+docker_service_script_dir: /tmp
