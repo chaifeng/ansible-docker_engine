@@ -4,5 +4,8 @@
 - name: Reload Systemd
   systemd: daemon_reload=yes
 
+- name: Restart Firewall
+  service: name=ufw state=restarted
+
 - name: Restart Docker
   service: name=docker state=restarted
