@@ -2,6 +2,12 @@
     - name: Ensure docker dependencies
       apt: name=apt-transport-https,ca-certificates,curl,software-properties-common
 
+    - name: Ensure the Docker GPG keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
     - name: Add Docker GPG key
       become: yes
       get_url:
