@@ -1,6 +1,8 @@
 - block:
     - name: Ensure docker dependencies
-      apt: name=apt-transport-https,ca-certificates,curl,software-properties-common
+      apt:
+        name: apt-transport-https,ca-certificates,curl,software-properties-common
+        state: present
 
     - name: Ensure the Docker GPG keyring directory exists
       ansible.builtin.file:
@@ -11,36 +13,57 @@
     - name: Add Docker GPG key
       become: yes
       get_url:
-        url: https://download.docker.com/linux/ubuntu/gpg
+        url: https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg
         dest: /etc/apt/keyrings/docker.asc
         mode: 0644
 
     - name: Ensure Docker CE Repository
-      apt_repository: >
-        filename='docker'
-        repo="deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
-        state=present update_cache=yes
+      apt_repository:
+        filename: 'docker'
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/{{ ansible_distribution | lower }} {{ ansible_distribution_release }} stable"
+        state: present
+        update_cache: yes
 
-    - name: Ensure Docker CE {{ docker_version }}
-      apt: >
-        name="docker-ce={{ docker_version }}~*"
-        update_cache=yes cache_valid_time="{{ 3600 * 24 * 7 }}"
-        autoremove="yes"
+    - name: Ensure Docker CE is installed
+      apt:
+        name: docker-ce
+        state: present
+        update_cache: yes
+        cache_valid_time: 86400  # Cache valid for 1 day
+        force_apt_get: yes
+
+    - name: Ensure specific Docker CE version installed
+      apt:
+        name: "docker-ce={{ docker_version }}~*"
+        state: present
+        update_cache: yes
+        cache_valid_time: 86400  # Cache valid for 1 day
+        force_apt_get: yes
+      when: docker_version is defined
 
     - name: Adding users to docker group
-      user: name="{{ item }}" append=yes groups=docker
-      with_items: "{{ docker_users }}"
+      user:
+        name: "{{ item }}"
+        append: yes
+        groups: docker
+      loop: "{{ docker_users }}"
+
   tags:
     - docker_install
 
 - block:
     - name: Ensure pip and setuptools
-      apt: name="python3-pip,python3-setuptools"
+      apt:
+        name: "python3-pip,python3-setuptools"
+        state: present
 
-    - name: 'Ensure docker modules'
-      pip: name="{{ item.key }}" version="{{ item.value }}"
-      with_dict:
-        docker-compose: 1.19.0
+    - name: Ensure docker modules
+      pip:
+        name: "{{ item.key }}"
+        version: "{{ item.value }}"
+        state: present
+      loop: "{{ lookup('dict', docker_pip_packages | default({})) }}"
+
   tags:
     - docker_dependencies
     - docker_install
@@ -62,130 +85,15 @@
       notify:
         - Reload Systemd
         - Restart Docker
-      when: ansible_service_mgr == "systemd"
+      when: ansible_service_mgr == "systemd" and docker_listen_addr is defined
 
     - name: Allow docker listen on TCP
       lineinfile:
         path: /etc/default/docker
         regexp: "^DOCKER_OPTS="
-        line: DOCKER_OPTS="-H unix:///var/run/docker.sock -H tcp://{{ docker_listen_addr }}"
+        line: "DOCKER_OPTS='-H unix:///var/run/docker.sock -H tcp://{{ docker_listen_addr }}'"
       notify: Restart Docker
-      when: ansible_service_mgr != "systemd"
-  when: docker_listen_addr is defined
+      when: ansible_service_mgr != "systemd" and docker_listen_addr is defined
   tags: docker_tcp
-
-- block:
-    - name: Disable Forward Policy for UFW
-      lineinfile:
-        path: /etc/default/ufw
-        regexp: "^DEFAULT_FORWARD_POLICY="
-        line: DEFAULT_FORWARD_POLICY="DROP"
-      notify: Restart Firewall
-
-    - name: Change the block name in after.rules
-      shell: |
-        if grep '^# \(BEGIN\|END\) ANSIBLE MANAGED BLOCK$' /etc/ufw/after.rules; then
-          sed -i.ufw-and-docker.bak 's/ANSIBLE MANAGED BLOCK$/UFW AND DOCKER/' /etc/ufw/after.rules
-        fi
-      register: change_ufw_block
-      changed_when: change_ufw_block.stdout | regex_search("ANSIBLE MANAGED BLOCK")
-
-    - name: Add custom iptables rules for docker
-      blockinfile:
-        path: /etc/ufw/after.rules
-        marker: "# {mark} UFW AND DOCKER"
-        validate: >-
-          bash -c "sed '/^# BEGIN/,/^# END/! d' '%s' | iptables-restore --test"
-        block: |
-          *filter
-          :ufw-user-forward - [0:0]
-          :DOCKER-USER - [0:0]
-          {% for host in groups['all']|sort -%}
-          {%- if hostvars[host]['private_ip'] is defined %}
-          # {{ host }}
-          -A DOCKER-USER -j RETURN -s {{ hostvars[host]['private_ip'] }}/32
-          {% endif -%}
-          {%- endfor %}
-          -A DOCKER-USER -j RETURN -s 10.0.0.0/8
-          -A DOCKER-USER -j RETURN -s 172.16.0.0/12
-          -A DOCKER-USER -j RETURN -s 192.168.0.0/16
-
-          -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
-
-          -A DOCKER-USER -j ufw-user-forward
-
-          -A DOCKER-USER -j DROP -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
-          -A DOCKER-USER -j DROP -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
-          -A DOCKER-USER -j DROP -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
-          -A DOCKER-USER -j DROP -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
-          -A DOCKER-USER -j DROP -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
-          -A DOCKER-USER -j DROP -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
-
-          -A DOCKER-USER -j RETURN
-          COMMIT
-      notify: Restart Firewall
-  tags: docker_tcp
-
-- name: Set docker log driver and insecure local registry
-  copy:
-    content: |
-      {
-      {% if docker_log_driver is defined and docker_log_driver == "syslog" %}
-        "log-driver": "syslog"
-        , "log-opts": {
-          {% raw -%}
-          "tag": "docker/{{.ImageName}}/{{.Name}}/{{.ID}}"
-          {%- endraw %}
-        }
-      {% endif %}
-      {% if docker_insecure_registry is defined %}
-        , "insecure-registries": ["localhost:5000", "{{ docker_insecure_registry }}:5000"]
-      {% endif %}
-      }
-    dest: /etc/docker/daemon.json
-  when: docker_log_driver is defined or docker_insecure_registry is defined
-  notify: Restart Docker
-  tags:
-    - docker_log_driver
-    - docker_insecure_registry
-
-- block:
-    - name: Ensure syslog config for docker engine
-      copy:
-        content: |
-          :syslogtag,contains,"docker/" {{ docker_syslog_file }}
-        dest: /etc/rsyslog.d/42-docker.conf
-      notify: Restart Rsyslog
-
-    - name: Logrotate for docker engine
-      copy:
-        content: |
-          {{ docker_syslog_file }}
-          {
-                  rotate 366
-                  daily
-                  missingok
-                  notifempty
-                  compress
-                  delaycompress
-                  sharedscripts
-                  postrotate
-                          invoke-rc.d rsyslog rotate >/dev/null 2>&1 || true
-                  endscript
-          }
-        dest: /etc/logrotate.d/docker
-
-    - name: Ensure dockerlog script to show logs
-      copy:
-        dest: /usr/local/bin/dockerlog
-        mode: a+x
-        content: |
-          #!/bin/bash
-
-          tail -100f "{{ docker_syslog_file }}" \
-          | sed --unbuffered -e "s/^\w\w\w \w\w .* docker\\/[^/]\\+\\/\\([^/]\\+\\)\\/[^:]\\+: /\\1: /"
-  when: docker_log_driver is defined and docker_log_driver == "syslog"
-  tags:
-    - docker_log_driver
 
 - meta: flush_handlers
