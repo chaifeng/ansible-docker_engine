@@ -9,13 +9,18 @@
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
+    - name: Check if Docker GPG key exists
+      stat:
+        path: /etc/apt/keyrings/docker.asc
+      register: docker_key
 
-    - name: Add Docker GPG key
+    - name: Add Docker GPG key if not present
       become: yes
       get_url:
         url: https://download.docker.com/linux/{{ ansible_distribution | lower }}/gpg
         dest: /etc/apt/keyrings/docker.asc
         mode: 0644
+      when: not docker_key.stat.exists | default(false)
 
     - name: Ensure Docker CE Repository
       apt_repository:
